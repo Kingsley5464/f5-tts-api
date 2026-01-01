@@ -1,11 +1,21 @@
 fastapi==0.101.0
 uvicorn==0.23.1
-torch>=2.1.0
-torchaudio>=2.1.0
+
+# Core ML
+torch==2.1.0+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Audio
 numpy
 soundfile
+scipy
 pydub
+
+# F5-TTS dependencies
+hydra-core>=1.3.2
+omegaconf>=2.3.0
 cached-path
 python-magic
-pydantic
 
+# FastAPI
+pydantic
