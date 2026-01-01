@@ -3,4 +3,9 @@ uvicorn==0.23.1
 torch>=2.1.0
 torchaudio>=2.1.0
 numpy
+soundfile
+pydub
+cached-path
+python-magic
 pydantic
+
