@@ -68,15 +68,13 @@ logging.info("Loading F5-TTS model...")
 
 model = F5TTS(
     device=DEVICE,
-    model_type="F5-TTS",
     vocab_file=str(cached_path("hf://SWivid/F5-TTS/F5TTS_Base/vocab.txt")),
+    ckpt_file=str(cached_path("hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.safetensors")),
+    vocoder_name="vocos",
     ode_method="euler",
     use_ema=True,
-    vocoder_name="vocos",
-    ckpt_file=str(
-        cached_path("hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.safetensors")
-    ),
 )
+
 
 logging.info("F5-TTS model loaded")
 
