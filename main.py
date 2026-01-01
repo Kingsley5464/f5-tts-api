@@ -1,3 +1,5 @@
+import os
+os.environ["MPLBACKEND"] = "Agg"
 import io
 import asyncio
 import logging
