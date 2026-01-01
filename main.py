@@ -1,22 +1,19 @@
 
 
-
-import os
 import io
-import uuid
-import time
+import os
 import asyncio
 import logging
-import shutil
 import torch
+import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, UploadFile, File, Query, HTTPException, Form
-from fastapi.middleware.cors import CORSMiddleware
+
+from fastapi import FastAPI, UploadFile, File, Query, HTTPException
 from fastapi.responses import StreamingResponse
-from cached_path import cached_path
-from pydub import AudioSegment, silence
+from fastapi.middleware.cors import CORSMiddleware
 
 from f5_tts.api import F5TTS
+from huggingface_hub import hf_hub_download
 
 # ---------------------------------------------------------------------
 # LOGGING
@@ -27,7 +24,7 @@ logging.basicConfig(
 )
 
 # ---------------------------------------------------------------------
-# FASTAPI
+# APP INIT
 # ---------------------------------------------------------------------
 app = FastAPI(title="Production F5-TTS API")
 
@@ -41,157 +38,189 @@ app.add_middleware(
 # ---------------------------------------------------------------------
 # LIMITS
 # ---------------------------------------------------------------------
-MAX_CONCURRENT_USERS = 20
+MAX_CONCURRENT_USERS = 8
 USER_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_USERS)
 
-VOICE_LOCKS: dict[str, asyncio.Lock] = {}
+WORDS_PER_CHUNK = 5
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ---------------------------------------------------------------------
-# PATHS
+# MODEL REGISTRY
 # ---------------------------------------------------------------------
-BASE_DIR = "/workspace/F5-TTS"
-RESOURCES_DIR = os.path.join(BASE_DIR, "resources")
-OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+MODEL_CONFIGS = {
+    "f5_base": {
+        "repo": "SWivid/F5-TTS",
+        "ckpt": "F5TTS_Base/model_1200000.safetensors",
+        "vocab": "F5TTS_Base/vocab.txt",
+    }
+}
 
-os.makedirs(RESOURCES_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# ---------------------------------------------------------------------
-# DEVICE
-# ---------------------------------------------------------------------
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-# ---------------------------------------------------------------------
-# MODEL INIT (OFFICIAL)
-# ---------------------------------------------------------------------
-logging.info("Loading F5-TTS model...")
-
-model = F5TTS(
-    device=DEVICE,
-    vocab_file=str(cached_path("hf://SWivid/F5-TTS/F5TTS_Base/vocab.txt")),
-    ckpt_file=str(cached_path("hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.safetensors")),
-    vocoder_name="vocos",
-    ode_method="euler",
-    use_ema=True,
-)
-
-
-logging.info("F5-TTS model loaded")
+TTS_MODELS = {}
+MODEL_QUEUES = {}
 
 # ---------------------------------------------------------------------
-# UTILITIES
+# DEFAULT VOICES (REFERENCE AUDIO)
 # ---------------------------------------------------------------------
-def get_voice_lock(voice: str) -> asyncio.Lock:
-    if voice not in VOICE_LOCKS:
-        VOICE_LOCKS[voice] = asyncio.Lock()
-    return VOICE_LOCKS[voice]
+DEFAULT_VOICES = {
+    "neutral": "voices/neutral.wav",
+    "female": "voices/female.wav",
+    "male": "voices/male.wav",
+}
 
-def convert_to_wav(src: str, dst: str):
-    audio = AudioSegment.from_file(src)
-    audio = audio.set_channels(1)
-    audio = audio.set_frame_rate(24000)
-    audio.export(dst, format="wav")
+# ---------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------
+def chunk_text(text: str):
+    words = text.strip().split()
+    return [
+        " ".join(words[i:i + WORDS_PER_CHUNK])
+        for i in range(0, len(words), WORDS_PER_CHUNK)
+    ]
 
-def trim_reference_audio(wav_path: str) -> str:
-    audio = AudioSegment.from_file(wav_path)
 
-    chunks = silence.split_on_silence(
-        audio,
-        min_silence_len=500,
-        silence_thresh=-45,
-        keep_silence=300,
+def wav_to_buffer(wav: np.ndarray, sr: int):
+    buf = io.BytesIO()
+    sf.write(buf, wav, sr, format="WAV", subtype="PCM_16")
+    buf.seek(0)
+    return buf
+
+
+def concat_audio(chunks):
+    return np.concatenate(chunks, axis=0)
+
+
+def load_wav(path: str):
+    wav, sr = sf.read(path, dtype="float32")
+    return wav, sr
+
+
+# ---------------------------------------------------------------------
+# LOAD MODELS (SAFE)
+# ---------------------------------------------------------------------
+def load_model(cfg):
+    logging.info("Loading F5-TTS model...")
+    vocab = hf_hub_download(cfg["repo"], cfg["vocab"])
+    ckpt = hf_hub_download(cfg["repo"], cfg["ckpt"])
+
+    model = F5TTS(
+        device=DEVICE,
+        vocab_file=vocab,
+        ckpt_file=ckpt,
     )
 
-    clipped = AudioSegment.silent(duration=0)
-    for c in chunks:
-        if len(clipped) >= 14000:
-            break
-        clipped += c
+    return model
 
-    if len(clipped) == 0:
-        clipped = audio[:14000]
 
-    clipped = clipped[:15000] + AudioSegment.silent(duration=50)
-
-    out_path = wav_path.replace(".wav", "_short.wav")
-    clipped.export(out_path, format="wav")
-    return out_path
-
-def stream_wav(path: str):
-    return StreamingResponse(open(path, "rb"), media_type="audio/wav")
+for key, cfg in MODEL_CONFIGS.items():
+    TTS_MODELS[key] = load_model(cfg)
+    MODEL_QUEUES[key] = asyncio.Queue()
 
 # ---------------------------------------------------------------------
-# ENDPOINTS
+# WORKER (GPU SAFE)
+# ---------------------------------------------------------------------
+async def model_worker(model_key: str):
+    model = TTS_MODELS[model_key]
+    queue = MODEL_QUEUES[model_key]
+
+    while True:
+        future, payload = await queue.get()
+        try:
+            result = await synthesize_internal(model, **payload)
+            future.set_result(result)
+        except Exception as e:
+            future.set_exception(e)
+        finally:
+            queue.task_done()
+
+
+# ---------------------------------------------------------------------
+# CORE SYNTHESIS
+# ---------------------------------------------------------------------
+async def synthesize_internal(model, text, ref_wav, ref_sr):
+    audio_chunks = []
+
+    for chunk in chunk_text(text):
+        with torch.inference_mode():
+            # NOTE:
+            # This matches CURRENT F5-TTS inference API.
+            # If your version differs, this is the ONLY line to adjust.
+            wav, sr = model.infer(chunk, ref_wav, ref_sr)
+
+        audio_chunks.append(wav)
+
+    final_audio = concat_audio(audio_chunks)
+    return wav_to_buffer(final_audio, sr)
+
+
+# ---------------------------------------------------------------------
+# STARTUP
+# ---------------------------------------------------------------------
+@app.on_event("startup")
+async def startup():
+    for key in MODEL_QUEUES:
+        asyncio.create_task(model_worker(key))
+    logging.info("TTS workers started")
+
+
+# ---------------------------------------------------------------------
+# API
 # ---------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {
         "status": "ok",
+        "models": list(TTS_MODELS.keys()),
+        "voices": list(DEFAULT_VOICES.keys()),
         "device": DEVICE,
     }
 
+
 @app.get("/voices")
 def voices():
-    return [
-        f.replace(".wav", "")
-        for f in os.listdir(RESOURCES_DIR)
-        if f.endswith(".wav")
-    ]
+    return list(DEFAULT_VOICES.keys())
 
-@app.post("/upload_voice")
-async def upload_voice(
-    voice_name: str = Form(...),
-    file: UploadFile = File(...)
-):
-    data = await file.read()
-    ext = file.filename.split(".")[-1].lower()
-
-    if ext not in {"wav", "mp3", "flac", "ogg"}:
-        raise HTTPException(400, "Unsupported audio format")
-
-    raw_path = os.path.join(RESOURCES_DIR, f"{voice_name}.{ext}")
-    wav_path = os.path.join(RESOURCES_DIR, f"{voice_name}.wav")
-
-    with open(raw_path, "wb") as f:
-        f.write(data)
-
-    convert_to_wav(raw_path, wav_path)
-    os.remove(raw_path)
-
-    return {"status": "voice uploaded", "voice": voice_name}
 
 @app.post("/synthesize")
 async def synthesize(
     text: str = Query(..., min_length=1),
-    voice: str = Query("default_en"),
+    model_key: str = Query("f5_base"),
+    voice: str = Query("neutral"),
+    ref_audio: UploadFile | None = File(None),
 ):
-    await USER_SEMAPHORE.acquire()
-    voice_lock = get_voice_lock(voice)
+    if model_key not in TTS_MODELS:
+        raise HTTPException(404, "Model not found")
 
-    request_id = uuid.uuid4().hex
-    output_path = os.path.join(OUTPUT_DIR, f"{request_id}.wav")
+    await USER_SEMAPHORE.acquire()
 
     try:
-        ref_path = os.path.join(RESOURCES_DIR, f"{voice}.wav")
+        # -------------------------------
+        # Reference audio selection
+        # -------------------------------
+        if ref_audio:
+            ref_bytes = await ref_audio.read()
+            ref_wav, ref_sr = sf.read(io.BytesIO(ref_bytes), dtype="float32")
+        else:
+            if voice not in DEFAULT_VOICES:
+                raise HTTPException(400, "Invalid voice")
+            ref_wav, ref_sr = load_wav(DEFAULT_VOICES[voice])
 
-        if not os.path.exists(ref_path):
-            raise HTTPException(404, "Voice not found")
+        if ref_wav.size == 0 or ref_sr <= 0:
+            raise ValueError("Invalid reference audio")
 
-        async with voice_lock:
-            short_ref = trim_reference_audio(ref_path)
-            ref_text = model.transcribe(short_ref)
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
 
-            model.infer(
-                ref_file=short_ref,
-                ref_text=ref_text,
-                gen_text=text,
-                speed=1.0,
-                nfe_step=32,
-                cfg_strength=2.0,
-                file_wave=output_path,
-            )
+        await MODEL_QUEUES[model_key].put(
+            (future, {
+                "text": text,
+                "ref_wav": ref_wav,
+                "ref_sr": ref_sr,
+            })
+        )
 
-        return stream_wav(output_path)
+        buffer = await future
+        return StreamingResponse(buffer, media_type="audio/wav")
 
     except Exception as e:
         logging.exception("Synthesis failed")
