@@ -43,21 +43,65 @@ DEVICE = "cpu"
 # ------------------------------------------------------------------
 # LOAD MODEL (AUTO DOWNLOAD)
 # ------------------------------------------------------------------
-VOCAB_FILE = hf_hub_download(
-    repo_id="SWivid/F5-TTS",
-    filename="F5TTS_Base/vocab.txt"
-)
+# VOCAB_FILE = hf_hub_download(
+#     repo_id="SWivid/F5-TTS",
+#     filename="F5TTS_Base/vocab.txt"
+# )
 
-CKPT_FILE = hf_hub_download(
-    repo_id="SWivid/F5-TTS",
-    filename="F5TTS_Base/model_1200000.safetensors"
-)
+# CKPT_FILE = hf_hub_download(
+#     repo_id="SWivid/F5-TTS",
+#     filename="F5TTS_Base/model_1200000.safetensors"
+# )
 
-model = F5TTS(
-    device=DEVICE,
-    vocab_file=VOCAB_FILE,
-    ckpt_file=CKPT_FILE,
-)
+# model = F5TTS(
+#     device=DEVICE,
+#     vocab_file=VOCAB_FILE,
+#     ckpt_file=CKPT_FILE,
+# )
+
+
+
+async def load_model():
+    global model
+    async with MODEL_LOCK:
+        if model is not None:
+            return
+
+        logging.info("Downloading F5-TTS model...")
+
+        vocab_file = hf_hub_download(
+            repo_id="SWivid/F5-TTS",
+            filename="F5TTS_Base/vocab.txt"
+        )
+
+        ckpt_file = hf_hub_download(
+            repo_id="SWivid/F5-TTS",
+            filename="F5TTS_Base/model_1200000.safetensors"
+        )
+
+        model = F5TTS(
+            device=DEVICE,
+            vocab_file=vocab_file,
+            ckpt_file=ckpt_file,
+        )
+
+        logging.info("F5-TTS model loaded successfully")
+
+
+
+
+
+
+
+
+
+
+
+
+model = None
+MODEL_LOCK = asyncio.Lock()
+
+
 
 # Default reference voice bundled in F5-TTS
 DEFAULT_REF_WAV = str(
@@ -97,10 +141,23 @@ async def worker():
         finally:
             voice_queue.task_done()
 
+
+
+
+
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(worker())
-    logging.info("F5-TTS worker started")
+    asyncio.create_task(load_model())
+    logging.info("Server started, loading model in background")
+
+
+
+
+# @app.on_event("startup")
+# async def startup():
+#     asyncio.create_task(worker())
+#     logging.info("F5-TTS worker started")
 
 # ------------------------------------------------------------------
 # ENDPOINTS
@@ -108,7 +165,8 @@ async def startup():
 @app.get("/health")
 def health():
     return {"status": "ok", "device": DEVICE}
-
+if model is None:
+    raise HTTPException(503, "Model is still loading, retry shortly")
 @app.post("/synthesize")
 async def synthesize(
     text: str = Query(..., min_length=1),
